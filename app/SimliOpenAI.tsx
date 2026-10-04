@@ -3,11 +3,13 @@ import IconSparkleLoader from "@/media/IconSparkleLoader";
 import React, { useCallback, useRef, useState } from "react";
 import { SimliClient, LogLevel } from "simli-client";
 import VideoBox from "./Components/VideoBox";
+import { ElevenTTS } from "@/lib/elevenTts";
 import cn from "./utils/TailwindMergeAndClsx";
 
 interface SessionResponse {
     openai: { value: string; expires_at: number; model: string };
     simli: { session_token: string; iceServers: RTCIceServer[] };
+    tts: { provider: "openai" | "elevenlabs"; elevenlabs: { url: string } | null };
 }
 
 let simliClient: SimliClient | null = null;
@@ -80,6 +82,9 @@ const SimliOpenAI: React.FC = () => {
     const audioContextRef = useRef<AudioContext | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
     const processorRef = useRef<ScriptProcessorNode | null>(null);
+    const ttsRef = useRef<ElevenTTS | null>(null);
+    const responseIdRef = useRef<string | null>(null);
+    const tSpeechStopRef = useRef<number>(0);
 
     const sendEvent = (event: Record<string, unknown>) => {
         const ws = wsRef.current;
@@ -122,7 +127,7 @@ const SimliOpenAI: React.FC = () => {
 
     /** Connects to the OpenAI Realtime API (GA) over WebSocket using the ephemeral key. */
     const connectOpenAI = useCallback(
-        (openai: SessionResponse["openai"]) => {
+        (openai: SessionResponse["openai"], tts: ElevenTTS | null) => {
             const ws = new WebSocket(
                 `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(openai.model)}`,
                 ["realtime", `openai-insecure-api-key.${openai.value}`]
@@ -144,6 +149,29 @@ const SimliOpenAI: React.FC = () => {
                     return;
                 }
                 switch (event.type) {
+                    // ---- ElevenLabs path: OpenAI streams text, ElevenLabs speaks it ----
+                    case "response.created":
+                        responseIdRef.current = event.response?.id ?? null;
+                        if (tts) tts.begin();
+                        break;
+                    case "response.output_text.delta":
+                        if (tts && event.response_id === responseIdRef.current) {
+                            if (tSpeechStopRef.current) {
+                                console.log(`[latency] fin de voz -> primer texto: ${Math.round(performance.now() - tSpeechStopRef.current)} ms`);
+                            }
+                            tts.push(event.delta);
+                        }
+                        break;
+                    case "response.output_text.done":
+                        if (tts && event.response_id === responseIdRef.current) {
+                            tts.end();
+                            console.log("Avatar:", event.text);
+                        }
+                        break;
+                    case "input_audio_buffer.speech_stopped":
+                        tSpeechStopRef.current = performance.now();
+                        break;
+                    // ---- OpenAI voice fallback path ----
                     case "response.output_audio.delta":
                     case "response.audio.delta": {
                         const pcm24 = base64ToInt16(event.delta);
@@ -154,7 +182,8 @@ const SimliOpenAI: React.FC = () => {
                         break;
                     }
                     case "input_audio_buffer.speech_started":
-                        // User barged in: drop whatever the avatar is still saying.
+                        // User barged in: stop TTS and drop whatever the avatar is still saying.
+                        tts?.interrupt();
                         simliClient?.ClearBuffer();
                         break;
                     case "conversation.item.input_audio_transcription.completed":
@@ -180,6 +209,11 @@ const SimliOpenAI: React.FC = () => {
         [startRecording]
     );
 
+    const stopTts = () => {
+        ttsRef.current?.close();
+        ttsRef.current = null;
+    };
+
     const handleStart = useCallback(async () => {
         setIsLoading(true);
         setError("");
@@ -202,11 +236,31 @@ const SimliOpenAI: React.FC = () => {
                 console.log("Simli connected");
                 setIsActive(true);
                 setIsLoading(false);
-                connectOpenAI(session.openai);
+                let tts: ElevenTTS | null = null;
+                if (session.tts?.provider === "elevenlabs" && session.tts.elevenlabs) {
+                    tts = new ElevenTTS(
+                        session.tts.elevenlabs.url,
+                        async () => {
+                            const r = await fetch("/api/tts-token", { method: "POST" });
+                            if (!r.ok) throw new Error(`tts-token HTTP ${r.status}`);
+                            return (await r.json()).url as string;
+                        },
+                        (pcm) => simliClient?.sendAudioData(pcm)
+                    );
+                    tts.onFirstAudio = () => {
+                        if (tSpeechStopRef.current) {
+                            console.log(`[latency] fin de voz -> primer audio ElevenLabs: ${Math.round(performance.now() - tSpeechStopRef.current)} ms`);
+                        }
+                    };
+                    tts.warmUp();
+                    ttsRef.current = tts;
+                }
+                connectOpenAI(session.openai, tts);
             });
             simliClient.on("stop", () => {
                 console.log("Simli disconnected");
                 wsRef.current?.close();
+                stopTts();
                 stopRecording();
                 setIsActive(false);
             });
@@ -222,6 +276,7 @@ const SimliOpenAI: React.FC = () => {
         stopRecording();
         wsRef.current?.close();
         wsRef.current = null;
+        stopTts();
         await simliClient?.stop();
         simliClient = null;
         setIsActive(false);
