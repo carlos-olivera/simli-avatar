@@ -1,466 +1,263 @@
+"use client";
 import IconSparkleLoader from "@/media/IconSparkleLoader";
-import { RealtimeClient } from "@openai/realtime-api-beta";
 import React, { useCallback, useRef, useState } from "react";
-import {
-    generateSimliSessionToken, SimliClient, SimliSessionRequest,
-    generateIceServers, LogLevel
-} from "simli-client";
+import { SimliClient, LogLevel } from "simli-client";
 import VideoBox from "./Components/VideoBox";
 import cn from "./utils/TailwindMergeAndClsx";
 
-interface SimliOpenAIProps {
-    simli_faceid: string;
-    openai_voice: "alloy" | "ash" | "ballad" | "coral" | "echo" | "sage" | "shimmer" | "verse";
-    openai_model: string;
-    initialPrompt: string;
-    onStart: () => void;
-    onClose: () => void;
-    showDottedFace: boolean;
+interface SessionResponse {
+    openai: { value: string; expires_at: number; model: string };
+    simli: { session_token: string; iceServers: RTCIceServer[] };
 }
 
-let simliClient: SimliClient | null = null
+let simliClient: SimliClient | null = null;
 
-const SimliOpenAI: React.FC<SimliOpenAIProps> = ({
-    simli_faceid,
-    openai_voice,
-    openai_model,
-    initialPrompt,
-    onStart,
-    onClose,
-    showDottedFace,
-}) => {
-    // State management
+/** Int16 PCM -> base64 */
+function int16ToBase64(data: Int16Array): string {
+    const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+    }
+    return btoa(binary);
+}
+
+/** base64 -> Int16 PCM */
+function base64ToInt16(b64: string): Int16Array {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Int16Array(bytes.buffer, 0, Math.floor(bytes.length / 2));
+}
+
+/** Downsample 24 kHz PCM16 to 16 kHz with a small FIR low-pass + linear interpolation. */
+function downsample(data: Int16Array, inRate: number, outRate: number): Int16Array {
+    if (inRate === outRate) return data;
+    const taps = 31;
+    const fc = (outRate / 2) / inRate;
+    const mid = (taps - 1) / 2;
+    const coeffs = new Float32Array(taps);
+    for (let i = 0; i < taps; i++) {
+        coeffs[i] = i === mid ? 2 * Math.PI * fc : Math.sin(2 * Math.PI * fc * (i - mid)) / (i - mid);
+        coeffs[i] *= 0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (taps - 1));
+    }
+    const sum = coeffs.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < taps; i++) coeffs[i] /= sum;
+
+    const filtered = new Float32Array(data.length);
+    for (let i = 0; i < data.length; i++) {
+        let acc = 0;
+        for (let j = 0; j < taps; j++) {
+            const idx = i - j + mid;
+            if (idx >= 0 && idx < data.length) acc += coeffs[j] * data[idx];
+        }
+        filtered[i] = acc;
+    }
+
+    const ratio = inRate / outRate;
+    const outLen = Math.floor(data.length / ratio);
+    const out = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+        const pos = i * ratio;
+        const idx = Math.floor(pos);
+        const frac = pos - idx;
+        const a = filtered[idx];
+        const b = idx + 1 < filtered.length ? filtered[idx + 1] : a;
+        out[i] = Math.max(-32768, Math.min(32767, Math.round(a + frac * (b - a))));
+    }
+    return out;
+}
+
+const SimliOpenAI: React.FC = () => {
     const [isLoading, setIsLoading] = useState(false);
-    const [isAvatarVisible, setIsAvatarVisible] = useState(false);
+    const [isActive, setIsActive] = useState(false);
     const [error, setError] = useState("");
-    const [isRecording, setIsRecording] = useState(false);
-    const [userMessage, setUserMessage] = useState("...");
 
-    // Refs for various components and states
     const videoRef = useRef<HTMLVideoElement>(null);
     const audioRef = useRef<HTMLAudioElement>(null);
-    const openAIClientRef = useRef<RealtimeClient | null>(null);
+    const wsRef = useRef<WebSocket | null>(null);
     const audioContextRef = useRef<AudioContext | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
     const processorRef = useRef<ScriptProcessorNode | null>(null);
-    const isFirstRun = useRef(true);
 
-    // New refs for managing audio chunk delay
-    const audioChunkQueueRef = useRef<Int16Array[]>([]);
-    const isProcessingChunkRef = useRef(false);
-
-    /**
-     * Initializes the Simli client with the provided configuration.
-     */
-    const initializeSimliClient = useCallback(async () => {
-        if (videoRef.current && audioRef.current) {
-            const SimliConfig: SimliSessionRequest = {
-                faceId: "710aff0c-4988-46ca-a4dc-e12b559b3139",
-                handleSilence: true,
-                maxSessionLength: 6000, // in seconds
-                maxIdleTime: 6000, // in seconds
-                model: "fasttalk"
-            };
-
-            simliClient = new SimliClient((
-                await generateSimliSessionToken(
-                    { apiKey: (process.env.NEXT_PUBLIC_SIMLI_API_KEY as string), config: SimliConfig },
-                )).session_token,
-                videoRef.current,
-                audioRef.current,
-                await generateIceServers(
-                    (process.env.NEXT_PUBLIC_SIMLI_API_KEY as string),
-
-                ),
-                LogLevel.DEBUG,
-                "p2p",
-            )
-            simliClient.on("start", () => {
-                console.log("SimliClient connected");
-                // Initialize OpenAI client
-                initializeOpenAIClient();
-            });
-            simliClient.on("speaking", () => console.log("SPEAKING"))
-            simliClient.on("silent", () => console.log("Silent"))
-
-            simliClient.on("stop", () => {
-                console.log("SimliClient disconnected");
-                openAIClientRef.current?.disconnect();
-                if (audioContextRef.current) {
-                    audioContextRef.current?.close();
-                }
-            });
-            await simliClient.start();
-            console.log("Simli Client initialized");
-        }
-    }, [simli_faceid]);
-
-    /**
-     * Initializes the OpenAI client, sets up event listeners, and connects to the API.
-     */
-    const initializeOpenAIClient = useCallback(async () => {
-        try {
-            console.log("Initializing OpenAI client...");
-            openAIClientRef.current = new RealtimeClient({
-                model: openai_model,
-                apiKey: process.env.NEXT_PUBLIC_OPENAI_API_KEY,
-                dangerouslyAllowAPIKeyInBrowser: true,
-            });
-
-            await openAIClientRef.current.updateSession({
-                instructions: initialPrompt,
-                voice: openai_voice,
-                turn_detection: { type: "server_vad" },
-                input_audio_transcription: { model: "whisper-1" },
-            });
-
-            // Set up event listeners
-            openAIClientRef.current.on(
-                "conversation.updated",
-                handleConversationUpdate
-            );
-
-            openAIClientRef.current.on(
-                "conversation.interrupted",
-                interruptConversation
-            );
-
-            openAIClientRef.current.on(
-                "input_audio_buffer.speech_stopped",
-                handleSpeechStopped
-            );
-            // openAIClientRef.current.on('response.canceled', handleResponseCanceled);
-
-
-            await openAIClientRef.current.connect().then(() => {
-                console.log("OpenAI Client connected successfully");
-                openAIClientRef.current?.createResponse();
-                startRecording();
-            });
-
-            setIsAvatarVisible(true);
-        } catch (error: any) {
-            console.error("Error initializing OpenAI client:", error);
-            setError(`Failed to initialize OpenAI client: ${error.message}`);
-        }
-    }, [initialPrompt]);
-
-    /**
-     * Handles conversation updates, including user and assistant messages.
-     */
-    const handleConversationUpdate = useCallback((event: any) => {
-        console.log("Conversation updated:", event);
-        const { item, delta } = event;
-
-        if (item.type === "message" && item.role === "assistant") {
-            console.log("Assistant message detected");
-            if (delta && delta.audio) {
-                const downsampledAudio = downsampleAudio(delta.audio, 24000, 16000);
-                audioChunkQueueRef.current.push(downsampledAudio);
-                if (!isProcessingChunkRef.current) {
-                    processNextAudioChunk();
-                }
-            }
-        } else if (item.type === "message" && item.role === "user") {
-            setUserMessage(item.content[0].transcript);
-        }
-    }, []);
-
-    /**
-     * Handles interruptions in the conversation flow.
-     */
-    const interruptConversation = () => {
-        console.warn("User interrupted the conversation");
-        simliClient?.ClearBuffer();
-        openAIClientRef.current?.cancelResponse("");
+    const sendEvent = (event: Record<string, unknown>) => {
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
     };
 
-    /**
-     * Processes the next audio chunk in the queue.
-     */
-    const processNextAudioChunk = useCallback(() => {
-        if (
-            audioChunkQueueRef.current.length > 0 &&
-            !isProcessingChunkRef.current
-        ) {
-            isProcessingChunkRef.current = true;
-            const audioChunk = audioChunkQueueRef.current.shift();
-            if (audioChunk) {
-                const chunkDurationMs = (audioChunk.length / 16000) * 1000; // Calculate chunk duration in milliseconds
-
-                // Send audio chunks to Simli immediately
-                simliClient?.sendAudioData(audioChunk as any);
-                console.log(
-                    "Sent audio chunk to Simli:",
-                    chunkDurationMs,
-                    "Duration:",
-                    chunkDurationMs.toFixed(2),
-                    "ms"
-                );
-                isProcessingChunkRef.current = false;
-                processNextAudioChunk();
-            }
-        }
-    }, []);
-
-    /**
-     * Handles the end of user speech.
-     */
-    const handleSpeechStopped = useCallback((event: any) => {
-        console.log("Speech stopped event received", event);
-    }, []);
-
-    /**
-     * Applies a simple low-pass filter to prevent aliasing of audio
-     */
-    const applyLowPassFilter = (
-        data: Int16Array,
-        cutoffFreq: number,
-        sampleRate: number
-    ): Int16Array => {
-        // Simple FIR filter coefficients
-        const numberOfTaps = 31; // Should be odd
-        const coefficients = new Float32Array(numberOfTaps);
-        const fc = cutoffFreq / sampleRate;
-        const middle = (numberOfTaps - 1) / 2;
-
-        // Generate windowed sinc filter
-        for (let i = 0; i < numberOfTaps; i++) {
-            if (i === middle) {
-                coefficients[i] = 2 * Math.PI * fc;
-            } else {
-                const x = 2 * Math.PI * fc * (i - middle);
-                coefficients[i] = Math.sin(x) / (i - middle);
-            }
-            // Apply Hamming window
-            coefficients[i] *=
-                0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (numberOfTaps - 1));
-        }
-
-        // Normalize coefficients
-        const sum = coefficients.reduce((acc, val) => acc + val, 0);
-        coefficients.forEach((_, i) => (coefficients[i] /= sum));
-
-        // Apply filter
-        const result = new Int16Array(data.length);
-        for (let i = 0; i < data.length; i++) {
-            let sum = 0;
-            for (let j = 0; j < numberOfTaps; j++) {
-                const idx = i - j + middle;
-                if (idx >= 0 && idx < data.length) {
-                    sum += coefficients[j] * data[idx];
-                }
-            }
-            result[i] = Math.round(sum);
-        }
-
-        return result;
-    };
-
-    /**
-     * Downsamples audio data from one sample rate to another using linear interpolation
-     * and anti-aliasing filter.
-     *
-     * @param audioData - Input audio data as Int16Array
-     * @param inputSampleRate - Original sampling rate in Hz
-     * @param outputSampleRate - Target sampling rate in Hz
-     * @returns Downsampled audio data as Int16Array
-     */
-    const downsampleAudio = (
-        audioData: Int16Array,
-        inputSampleRate: number,
-        outputSampleRate: number
-    ): Int16Array => {
-        if (inputSampleRate === outputSampleRate) {
-            return audioData;
-        }
-
-        if (inputSampleRate < outputSampleRate) {
-            throw new Error("Upsampling is not supported");
-        }
-
-        // Apply low-pass filter to prevent aliasing
-        // Cut off at slightly less than the Nyquist frequency of the target sample rate
-        const filteredData = applyLowPassFilter(
-            audioData,
-            outputSampleRate * 0.45, // Slight margin below Nyquist frequency
-            inputSampleRate
-        );
-
-        const ratio = inputSampleRate / outputSampleRate;
-        const newLength = Math.floor(audioData.length / ratio);
-        const result = new Int16Array(newLength);
-
-        // Linear interpolation
-        for (let i = 0; i < newLength; i++) {
-            const position = i * ratio;
-            const index = Math.floor(position);
-            const fraction = position - index;
-
-            if (index + 1 < filteredData.length) {
-                const a = filteredData[index];
-                const b = filteredData[index + 1];
-                result[i] = Math.round(a + fraction * (b - a));
-            } else {
-                result[i] = filteredData[index];
-            }
-        }
-
-        return result;
-    };
-
-    /**
-     * Starts audio recording from the user's microphone.
-     */
     const startRecording = useCallback(async () => {
-        if (!audioContextRef.current) {
-            audioContextRef.current = new AudioContext({ sampleRate: 24000 });
-        }
-
         try {
-            console.log("Starting audio recording...");
+            audioContextRef.current = new AudioContext({ sampleRate: 24000 });
             streamRef.current = await navigator.mediaDevices.getUserMedia({
-                audio: true,
+                audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
             });
-            const source = audioContextRef.current.createMediaStreamSource(
-                streamRef.current
-            );
-            processorRef.current = audioContextRef.current.createScriptProcessor(
-                2048,
-                1,
-                1
-            );
-
+            const source = audioContextRef.current.createMediaStreamSource(streamRef.current);
+            processorRef.current = audioContextRef.current.createScriptProcessor(2048, 1, 1);
             processorRef.current.onaudioprocess = (e) => {
-                const inputData = e.inputBuffer.getChannelData(0);
-                const audioData = new Int16Array(inputData.length);
-                let sum = 0;
-
-                for (let i = 0; i < inputData.length; i++) {
-                    const sample = Math.max(-1, Math.min(1, inputData[i]));
-                    audioData[i] = Math.floor(sample * 32767);
-                    sum += Math.abs(sample);
+                const input = e.inputBuffer.getChannelData(0);
+                const pcm = new Int16Array(input.length);
+                for (let i = 0; i < input.length; i++) {
+                    const s = Math.max(-1, Math.min(1, input[i]));
+                    pcm[i] = Math.floor(s * 32767);
                 }
-
-                openAIClientRef.current?.appendInputAudio(audioData);
+                sendEvent({ type: "input_audio_buffer.append", audio: int16ToBase64(pcm) });
             };
-
             source.connect(processorRef.current);
             processorRef.current.connect(audioContextRef.current.destination);
-            setIsRecording(true);
-            console.log("Audio recording started");
         } catch (err) {
             console.error("Error accessing microphone:", err);
-            setError("Error accessing microphone. Please check your permissions.");
+            setError("No se pudo acceder al micrófono. Revisa los permisos del navegador.");
         }
     }, []);
 
-    /**
-     * Stops audio recording from the user's microphone
-     */
     const stopRecording = useCallback(() => {
-        if (processorRef.current) {
-            processorRef.current.disconnect();
-            processorRef.current = null;
-        }
-        if (streamRef.current) {
-            streamRef.current.getTracks().forEach((track) => track.stop());
-            streamRef.current = null;
-        }
-        setIsRecording(false);
-        console.log("Audio recording stopped");
+        processorRef.current?.disconnect();
+        processorRef.current = null;
+        streamRef.current?.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+        audioContextRef.current?.close().catch(() => undefined);
+        audioContextRef.current = null;
     }, []);
 
-    /**
-     * Handles the start of the interaction, initializing clients and starting recording.
-     */
+    /** Connects to the OpenAI Realtime API (GA) over WebSocket using the ephemeral key. */
+    const connectOpenAI = useCallback(
+        (openai: SessionResponse["openai"]) => {
+            const ws = new WebSocket(
+                `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(openai.model)}`,
+                ["realtime", `openai-insecure-api-key.${openai.value}`]
+            );
+            wsRef.current = ws;
+
+            ws.onopen = () => {
+                console.log("OpenAI Realtime connected");
+                // Let the avatar greet first (session config comes from the server-minted secret).
+                sendEvent({ type: "response.create" });
+                startRecording();
+            };
+
+            ws.onmessage = (msg) => {
+                let event: any;
+                try {
+                    event = JSON.parse(msg.data);
+                } catch {
+                    return;
+                }
+                switch (event.type) {
+                    case "response.output_audio.delta":
+                    case "response.audio.delta": {
+                        const pcm24 = base64ToInt16(event.delta);
+                        const pcm16 = downsample(pcm24, 24000, 16000);
+                        simliClient?.sendAudioData(
+                            new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength)
+                        );
+                        break;
+                    }
+                    case "input_audio_buffer.speech_started":
+                        // User barged in: drop whatever the avatar is still saying.
+                        simliClient?.ClearBuffer();
+                        break;
+                    case "conversation.item.input_audio_transcription.completed":
+                        console.log("Usuario:", event.transcript);
+                        break;
+                    case "response.output_audio_transcript.done":
+                        console.log("Avatar:", event.transcript);
+                        break;
+                    case "error":
+                        console.error("OpenAI error:", event.error);
+                        break;
+                    default:
+                        break;
+                }
+            };
+
+            ws.onerror = (e) => {
+                console.error("OpenAI WebSocket error", e);
+                setError("Error de conexión con OpenAI.");
+            };
+            ws.onclose = (e) => console.log("OpenAI WebSocket closed", e.code, e.reason);
+        },
+        [startRecording]
+    );
+
     const handleStart = useCallback(async () => {
         setIsLoading(true);
         setError("");
-        onStart();
-
         try {
-            console.log("Starting...");
-            initializeSimliClient();
+            const res = await fetch("/api/session", { method: "POST" });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+            const session = data as SessionResponse;
 
-            // await simliClient.start();
-        } catch (error: any) {
-            console.error("Error starting interaction:", error);
-            setError(`Error starting interaction: ${error.message}`);
-        } finally {
-            setIsAvatarVisible(true);
+            if (!videoRef.current || !audioRef.current) throw new Error("Video element not ready");
+            simliClient = new SimliClient(
+                session.simli.session_token,
+                videoRef.current,
+                audioRef.current,
+                session.simli.iceServers,
+                LogLevel.ERROR,
+                "p2p"
+            );
+            simliClient.on("start", () => {
+                console.log("Simli connected");
+                setIsActive(true);
+                setIsLoading(false);
+                connectOpenAI(session.openai);
+            });
+            simliClient.on("stop", () => {
+                console.log("Simli disconnected");
+                wsRef.current?.close();
+                stopRecording();
+                setIsActive(false);
+            });
+            await simliClient.start();
+        } catch (err: any) {
+            console.error("Error starting interaction:", err);
+            setError(`No se pudo iniciar: ${err?.message || err}`);
             setIsLoading(false);
         }
-    }, [onStart]);
+    }, [connectOpenAI, stopRecording]);
 
-    /**
-     * Handles stopping the interaction, cleaning up resources and resetting states.
-     */
     const handleStop = useCallback(async () => {
-        console.log("Stopping interaction...");
-        setIsLoading(false);
-        setError("");
         stopRecording();
-        setIsAvatarVisible(false);
+        wsRef.current?.close();
+        wsRef.current = null;
         await simliClient?.stop();
-        openAIClientRef.current?.disconnect();
-        if (audioContextRef.current) {
-            audioContextRef.current?.close();
-            audioContextRef.current = null;
-        }
-        stopRecording();
-        onClose();
-        console.log("Interaction stopped");
+        simliClient = null;
+        setIsActive(false);
+        setIsLoading(false);
     }, [stopRecording]);
 
-    /**
-     * Simli Event listeners
-     */
-
     return (
-        <>
-            <div
-                className={`transition-all duration-300 ${showDottedFace ? "h-0 overflow-hidden" : "h-auto"
-                    }`}
-            >
-                <VideoBox video={videoRef} audio={audioRef} />
-            </div>
-            <div className="flex flex-col items-center">
-                {!isAvatarVisible ? (
+        <div className="flex flex-col items-center">
+            <VideoBox video={videoRef} audio={audioRef} />
+            <div className="mt-6 flex flex-col items-center">
+                {!isActive ? (
                     <button
                         onClick={handleStart}
                         disabled={isLoading}
                         className={cn(
-                            "w-full h-[52px] mt-4 disabled:bg-[#343434] disabled:text-white disabled:hover:rounded-[100px] bg-simliblue text-white py-3 px-6 rounded-[100px] transition-all duration-300 hover:text-black hover:bg-white hover:rounded-sm",
+                            "h-[48px] min-w-[220px] px-6 rounded-full text-white bg-white/10 hover:bg-white hover:text-black transition-all duration-300 disabled:opacity-50",
                             "flex justify-center items-center"
                         )}
                     >
                         {isLoading ? (
                             <IconSparkleLoader className="h-[20px] animate-loader" />
                         ) : (
-                            <span className="font-abc-repro-mono font-bold w-[164px]">
-                                Test Interaction
-                            </span>
+                            <span className="font-abc-repro-mono font-bold">Iniciar conversación</span>
                         )}
                     </button>
                 ) : (
-                    <>
-                        <div className="flex items-center gap-4 w-full">
-                            <button
-                                onClick={handleStop}
-                                className={cn(
-                                    "mt-4 group text-white flex-grow bg-red hover:rounded-sm hover:bg-white h-[52px] px-6 rounded-[100px] transition-all duration-300"
-                                )}
-                            >
-                                <span className="font-abc-repro-mono group-hover:text-black font-bold w-[164px] transition-all duration-300">
-                                    Stop Interaction
-                                </span>
-                            </button>
-                        </div>
-                    </>
+                    <button
+                        onClick={handleStop}
+                        className="h-[48px] min-w-[220px] px-6 rounded-full text-white/80 bg-white/5 hover:bg-red hover:text-white transition-all duration-300"
+                    >
+                        <span className="font-abc-repro-mono font-bold">Terminar</span>
+                    </button>
                 )}
+                {error && <p className="mt-3 text-sm text-red">{error}</p>}
             </div>
-        </>
+        </div>
     );
 };
 

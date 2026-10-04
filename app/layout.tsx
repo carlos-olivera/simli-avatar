@@ -7,8 +7,8 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "Simli App",
-  description: "create-simli-app (OpenAI)",
+  title: "Avatar",
+  description: "Avatar conversacional (Simli + OpenAI Realtime)",
 };
 
 export default function RootLayout({
@@ -17,7 +17,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${abcReproMono.variable} ${abcRepro.variable}`}>
+    <html lang="es" className={`${abcReproMono.variable} ${abcRepro.variable}`}>
       <body className={inter.className}>{children}</body>
     </html>
   );

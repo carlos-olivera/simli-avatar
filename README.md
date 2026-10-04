@@ -1,36 +1,32 @@
-# Create Simli App (OpenAI)
-This starter is an example of how to create a composable Simli interaction that runs in a Next.js app.
+# simli-avatar
 
- ## Usage
- 1. Rename .env_sample to .env and paste your API keys: [SIMLI-API-KEY](https://www.simli.com/profile) and [OPENAI-API-KEY](https://platform.openai.com/settings/profile?tab=api-keys) <br/> If you want to try Simli but don't have API access to these third parties, ask in Discord and we can help you out with that ([Discord Link](https://discord.gg/yQx49zNF4d)). 
-```js
-NEXT_PUBLIC_SIMLI_API_KEY="SIMLI-API-KEY"
-NEXT_PUBLIC_OPENAI_API_KEY="OPENAI-API-KEY"
-``` 
+Conversational avatar demo (Spanish, Bolivian neutral) built on
+[simliai/create-simli-app-openai](https://github.com/simliai/create-simli-app-openai):
+Simli renders the face, OpenAI Realtime (GA API) handles voice-to-voice.
 
-2. Insall packages
+## Security model
+- `OPENAI_API_KEY` and `SIMLI_API_KEY` live **only on the server**.
+- `POST /api/session` mints a short-lived OpenAI Realtime client secret (`/v1/realtime/client_secrets`, `ek_…`, 120 s)
+  plus a Simli session token and ICE servers. The browser only ever sees these ephemeral tokens.
+- Avatar instructions are baked into the client secret server-side.
+- Basic in-memory per-IP rate limit (`SESSION_RATE_LIMIT`, default 10 sessions / 10 min).
+
+## Environment variables
+| Name | Required | Default |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | yes | – |
+| `SIMLI_API_KEY` | yes | – |
+| `SIMLI_FACE_ID` | no | `710aff0c-4988-46ca-a4dc-e12b559b3139` (example default) |
+| `AVATAR_INSTRUCTIONS` | no | Spanish (Bolivia) assistant prompt |
+| `OPENAI_REALTIME_MODEL` | no | `gpt-realtime-2.1-mini` |
+| `OPENAI_VOICE` | no | `marin` |
+| `SIMLI_MODEL` | no | `fasttalk` |
+| `SIMLI_MAX_SESSION_SECONDS` / `SIMLI_MAX_IDLE_SECONDS` | no | `600` / `120` |
+| `LOGO_URL` (runtime) or `NEXT_PUBLIC_LOGO_URL` (build time) | no | none |
+
+## Run
 ```bash
 npm install
+cp .env_sample .env.local   # fill in keys
+npm run dev                 # or: npm run build && npm start  (honours $PORT)
 ```
-
-3. Run
-```bash
-npm run dev
-```
-
-4. Customize your avatar's face and prompt by editing app/page.tsx.
-```js
-const avatar = {
-  name: "Frank",
-  simli_faceid: "5514e24d-6086-46a3-ace4-6a7264e5cb7c",
-  initialPrompt: "You are a helpful AI assistant named Frank. You are friendly and concise in your responses. Your task is to help users with any questions they might have.",
-};
-```
-
-## Characters
-You can swap out the character by finding one that you like in the [docs](https://docs.simli.com/introduction), or [create your own](https://app.simli.com/) 
-
-![alt text](media/image.png) ![alt text](media/image-4.png) ![alt text](media/image-2.png) ![alt text](media/image-3.png) ![alt text](media/image-5.png) ![alt text](media/image-6.png)
-
-## Deploy on Vercel
-An easy way to deploy your avatar interaction to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme). 
